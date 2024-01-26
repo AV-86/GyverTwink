@@ -19,6 +19,18 @@
   Мигнул розовым - создал точку
 */
 
+// ================== LIBS ==================
+#include <ESP8266WiFi.h>
+#include <WiFiUdp.h>
+#include <SimplePortal.h>
+#include <FastLED.h>
+#include <EEManager.h>
+#include <EncButton.h>
+#include "palettes.h"
+#include "Timer.h"
+#include <AsyncMqttClient.h>
+#include <Ticker.h>
+
 // ================ НАСТРОЙКИ ================
 #define BTN_PIN D3      // пин кнопки
 #define BTN_TOUCH 0     // 1 - сенсорная кнопка, 0 - нет
@@ -33,15 +45,7 @@
 #define GT_AP_PASS "12345678"
 //#define DEBUG_SERIAL_GT   // раскомментируй, чтобы включить отладку
 
-// ================== LIBS ==================
-#include <ESP8266WiFi.h>
-#include <WiFiUdp.h>
-#include <SimplePortal.h>
-#include <FastLED.h>
-#include <EEManager.h>
-#include <EncButton.h>
-#include "palettes.h"
-#include "Timer.h"
+#define LED_BUILTINN D4
 
 // ================== OBJECTS ==================
 WiFiServer server(80);
@@ -51,6 +55,12 @@ CRGB leds[LED_MAX];
 CLEDController *strip;
 EncButton<EB_TICK, BTN_PIN> btn;
 IPAddress myIP;
+
+AsyncMqttClient mqttClient;
+Ticker mqttReconnectTimer;
+WiFiEventHandler wifiConnectHandler;
+WiFiEventHandler wifiDisconnectHandler;
+Ticker wifiReconnectTimer;
 
 // ================== EEPROM BLOCKS ==================
 struct Cfg {
@@ -97,6 +107,9 @@ bool calibF = false;
 byte curEff = 0;
 byte forceEff = 0;
 
+bool RemoteOnOffChanged = false;
+bool RemoteOnOffState = false;
+
 #ifdef DEBUG_SERIAL_GT
 #define DEBUGLN(x) Serial.println(x)
 #define DEBUG(x) Serial.print(x)
@@ -106,6 +119,101 @@ byte forceEff = 0;
 #endif
 
 // ================== SETUP ==================
+
+void connectToMqtt() {
+  Serial.println("Connecting to MQTT...");
+  mqttClient.connect();
+}
+
+void onWifiConnect(const WiFiEventStationModeGotIP& event) {
+  Serial.println("Connected to Wi-Fi.");
+  connectToMqtt();
+}
+
+void onWifiDisconnect(const WiFiEventStationModeDisconnected& event) {
+  Serial.println("Disconnected from Wi-Fi.");
+  mqttReconnectTimer.detach(); // ensure we don't reconnect to MQTT while reconnecting to Wi-Fi
+  wifiReconnectTimer.once(2, connectToWifi);
+}
+
+void onMqttConnect(bool sessionPresent) {
+  Serial.println("Connected to MQTT.");
+  Serial.print("Session present: ");
+  Serial.println(sessionPresent);
+  uint16_t packetIdSub = mqttClient.subscribe("yolka/onoff", 2);
+  Serial.print("Subscribing at QoS 2, packetId: ");
+  Serial.println(packetIdSub);
+
+
+  mqttClient.publish("test/lol", 0, true, "test 1");
+  Serial.println("Publishing at QoS 0");
+  
+  uint16_t packetIdPub1 = mqttClient.publish("test/lol", 1, true, "test 2");
+  Serial.print("Publishing at QoS 1, packetId: ");
+  Serial.println(packetIdPub1);
+
+  uint16_t packetIdPub2 = mqttClient.publish("test/lol", 2, true, "test 3");
+  Serial.print("Publishing at QoS 2, packetId: ");
+  Serial.println(packetIdPub2);
+}
+
+void onMqttDisconnect(AsyncMqttClientDisconnectReason reason) {
+  Serial.println("Disconnected from MQTT.");
+
+  if (WiFi.isConnected()) {
+    mqttReconnectTimer.once(2, connectToMqtt);
+  }
+}
+
+void onMqttSubscribe(uint16_t packetId, uint8_t qos) {
+  Serial.println("Subscribe acknowledged.");
+  Serial.print("  packetId: ");
+  Serial.println(packetId);
+  Serial.print("  qos: ");
+  Serial.println(qos);
+}
+
+void onMqttUnsubscribe(uint16_t packetId) {
+  Serial.println("Unsubscribe acknowledged.");
+  Serial.print("  packetId: ");
+  Serial.println(packetId);
+}
+
+void onMqttMessage(char* topic, char* payload, AsyncMqttClientMessageProperties properties, size_t len, size_t index, size_t total) {
+  Serial.println("Publish received.");
+  Serial.print("  topic: ");
+  Serial.println(topic);
+  Serial.print("  qos: ");
+  Serial.println(properties.qos);
+  Serial.print("  dup: ");
+  Serial.println(properties.dup);
+  Serial.print("  retain: ");
+  Serial.println(properties.retain);
+  Serial.print("  len: ");
+  Serial.println(len);
+  Serial.print("  index: ");
+  Serial.println(index);
+  Serial.print("  total: ");
+  Serial.println(total);
+
+  Serial.print("  payload: ");
+  Serial.println(payload);
+
+  RemoteOnOffChanged = true;  
+  if('0' == payload[0]){RemoteOnOffState = false;}
+  if('1' == payload[0]){RemoteOnOffState = true;}
+ 
+
+}
+
+void onMqttPublish(uint16_t packetId) {
+  Serial.println("Publish acknowledged.");
+  Serial.print("  packetId: ");
+  Serial.println(packetId);
+}
+
+
+
 void setup() {
 #ifdef DEBUG_SERIAL_GT
   Serial.begin(115200);
@@ -116,13 +224,39 @@ void setup() {
   startStrip();
   EEPROM.begin(2048); // с запасом!
 
+  Serial.begin(115200);
+
   // если это первый запуск или щелчок по кнопке, открываем портал
   if (EEwifi.begin(0, 'a') || checkButton()) portalRoutine();
 
+
+  wifiConnectHandler = WiFi.onStationModeGotIP(onWifiConnect);
+  wifiDisconnectHandler = WiFi.onStationModeDisconnected(onWifiDisconnect);
+
+  mqttClient.onConnect(onMqttConnect);
+  mqttClient.onDisconnect(onMqttDisconnect);
+  mqttClient.onSubscribe(onMqttSubscribe);
+  mqttClient.onUnsubscribe(onMqttUnsubscribe);
+  mqttClient.onMessage(onMqttMessage);
+  mqttClient.onPublish(onMqttPublish);
+  
+  mqttClient.setCredentials("u_P0LBPU", "k2wBcYrb");
+  mqttClient.setServer("m5.wqtt.ru", 8920);
+
+
   // создаём точку или подключаемся к AP
-  if (portalCfg.mode == WIFI_AP || (portalCfg.mode == WIFI_STA && portalCfg.SSID[0] == '\0')) setupAP();
-  else setupSTA();
+  if (portalCfg.mode == WIFI_AP || (portalCfg.mode == WIFI_STA && portalCfg.SSID[0] == '\0')){
+     setupAP();
+  }else{
+     connectToWifi();
+  }
+  
+  
   DEBUGLN(myIP);
+
+  // setupMQTT("m5.wqtt.ru", 8920, "u_P0LBPU", "k2wBcYrb")
+
+
 
   EEcfg.begin(EEwifi.nextAddr(), 'a');
   EEeff.begin(EEcfg.nextAddr(), 'a');
@@ -166,6 +300,17 @@ void loop() {
     DEBUGLN("Off tmr");
   }
 
+  if(RemoteOnOffChanged){
+    RemoteOnOffChanged = false;
+
+    cfg.power = RemoteOnOffState;
+    if (!cfg.power) strip->showLeds(0);
+    EEcfg.update();
+
+  }
+
   // показываем эффект, если включены
   if (!calibF && cfg.power) effects();
+
+ // Wait for two seconds (to demonstrate the active low LED)
 }

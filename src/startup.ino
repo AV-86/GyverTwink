@@ -43,7 +43,7 @@ void setupAP() {
   fadeBlink(CRGB::Magenta);
 }
 
-void setupSTA() {
+void connectToWifi() {
   DEBUG("Connecting to AP... ");
   WiFi.softAPdisconnect();
   WiFi.disconnect();
